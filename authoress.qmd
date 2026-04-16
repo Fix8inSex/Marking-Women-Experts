@@ -1,0 +1,1303 @@
+---
+title: "STM_authoress"
+author: "Bae."
+format: html
+editor: visual
+---
+
+## 데이터 전처리
+
+```{r}
+
+# 1. 패키지 로드
+library(tidyverse)
+library(readxl)
+library(stm)
+
+# 2. 데이터 불러오기 (실행 파일과 같은 폴더)
+base_dir <- getwd()
+data_file <- file.path(base_dir, "authoress_Token.xlsx")
+df <- read_excel(data_file)
+
+# 3. 변수명 확인
+print(names(df))
+# 예상: Year, Month, Day, Publisher, Title, Token, Voca, ... 등
+
+# 4. 불용어(stopwords) 지정
+stopwords <- c(
+  '여류'
+
+  
+)
+
+# 5. (선택) 날짜 변수 합치기
+df <- df %>%
+  mutate(Date = as.Date(sprintf("%04d-%02d-%02d", Year, Month, Day)))
+
+# 6. Token 열이 factor면 character로 변환
+df$Token <- as.character(df$Token)
+
+# 7. vocab 중복 제거
+all_tokens <- unlist(strsplit(df$Token, " "))
+vocab <- unique(all_tokens)
+
+# 8. STM용 입력 데이터 생성(textProcessor)
+myprocess <- textProcessor(
+  documents = df$Token,
+  metadata = df,
+  wordLengths = c(2, Inf),      
+  lowercase = FALSE,              
+  removenumbers = FALSE,
+  removepunctuation = FALSE,
+  removestopwords = FALSE,
+  stem = FALSE,
+  customstopwords = stopwords
+)
+
+# 9. vocab 중복 제거 반영 (myprocess$vocab에 unique 적용)
+myprocess$vocab <- unique(myprocess$vocab)
+
+# 10. 5개 이상의 문서에 등장한 단어만 사용
+out <- prepDocuments(
+  myprocess$documents,
+  myprocess$vocab,
+  myprocess$meta,
+  lower.thresh = 5
+)
+
+# 11. 결과 저장
+save_dir <- file.path(base_dir, "topic_selection_results", "STM")
+if (!dir.exists(save_dir)) dir.create(save_dir, recursive = TRUE)
+saveRDS(out, file = file.path(save_dir, "out_preprocessed.rds"))
+
+cat("STM용 데이터 전처리 및 저장 완료!\n")
+
+
+
+```
+
+## 토픽수 탐색 searchK
+
+```{r}
+
+# Exclusivity 포함, Lower Bound 제외한 4분할 그래프 생성
+
+
+# ===============================================
+# [설정 섹션] 사용자 커스터마이징 구간
+# ===============================================
+
+# 토픽 수 범위 설정 (K_min:K_max)
+K_min <- 7
+K_max <- 20
+
+# 시드값 (재현성 보장)
+SEED_VALUE <- 2024
+
+# EM 알고리즘 최대 반복 횟수
+MAX_EM_ITS <- 75
+
+# 병렬 처리 코어 수 (1 = 단일 코어, >1 = 병렬 처리)
+N_CORES <- 1
+
+# 그래프 해상도 (DPI)
+GRAPH_DPI <- 300
+
+# 그래프 크기 설정
+GRAPH_WIDTH <- 12
+GRAPH_HEIGHT <- 9
+
+# =================================================
+
+# 1. 패키지 로드
+library(stm)
+library(tidyverse)
+library(ggplot2)
+library(gridExtra)
+library(rlang)
+
+# 2. 파일 경로 설정
+base_dir <- getwd()
+searchK_rds_path <- file.path(base_dir, "topic_selection_results", "STM", "model_searchK.rds")
+out_rds_path <- file.path(base_dir, "topic_selection_results", "STM", "out_preprocessed.rds")
+output_dir <- file.path(base_dir, "topic_selection_results", "STM")
+
+# output_dir 생성 (없으면)
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ====================================================
+# 3. searchK 결과 불러오기 또는 새로 계산
+# ====================================================
+if (file.exists(searchK_rds_path)) {
+  message("저장된 searchK 결과를 불러옵니다.")
+  model_searchK <- readRDS(searchK_rds_path)
+} else {
+  message("searchK 결과 파일이 없어 새로 계산합니다.")
+  out <- readRDS(out_rds_path)
+  out$meta$Date <- as.Date(out$meta$Date)
+  out$meta$Year <- as.numeric(format(out$meta$Date, "%Y"))
+  
+  # Publisher, Voca 컬럼 존재 여부에 따라 prevalence 공식 결정
+  if ("Publisher" %in% colnames(out$meta) & "Voca" %in% colnames(out$meta)) {
+    prevalence_formula <- ~Publisher + Voca + s(Year)
+    out$meta$Publisher <- as.factor(out$meta$Publisher)
+    out$meta$Voca <- as.factor(out$meta$Voca)
+    message("Prevalence formula: ~Publisher + Voca + s(Year)")
+  } else if ("Publisher" %in% colnames(out$meta)) {
+    prevalence_formula <- ~Publisher + s(Year)
+    out$meta$Publisher <- as.factor(out$meta$Publisher)
+    message("Prevalence formula: ~Publisher + s(Year)")
+  } else if ("Voca" %in% colnames(out$meta)) {
+    prevalence_formula <- ~Voca + s(Year)
+    out$meta$Voca <- as.factor(out$meta$Voca)
+    message("Prevalence formula: ~Voca + s(Year)")
+  } else {
+    prevalence_formula <- ~s(Year)
+    message("Prevalence formula: ~s(Year)")
+  }
+  
+  # 설정 섹션에서 정의한 K 범위 사용
+  k_candidates <- K_min:K_max
+  message(sprintf("searchK 실행: K = %s", paste(k_candidates, collapse = ", ")))
+  
+  model_searchK <- searchK(
+    documents = out$documents,
+    vocab = out$vocab,
+    K = k_candidates,
+    prevalence = prevalence_formula,
+    data = out$meta,
+    init.type = "Spectral",
+    seed = SEED_VALUE,
+    max.em.its = MAX_EM_ITS,
+    cores = N_CORES
+  )
+  
+  saveRDS(model_searchK, searchK_rds_path)
+  message(sprintf("searchK 결과가 저장되었습니다: %s", searchK_rds_path))
+}
+
+# ===================================================
+# 4. 결과 데이터프레임 정리 및 타입 변환
+# ===================================================
+results_df <- model_searchK$results %>%
+  as_tibble() %>%
+  mutate(
+    K = as.integer(K),
+    semcoh = as.numeric(semcoh),
+    exclus = as.numeric(exclus),
+    heldout = as.numeric(heldout),
+    residual = as.numeric(residual),
+    bound = as.numeric(bound)
+  )
+
+message("결과 데이터프레임 구조:")
+print(str(results_df))
+message("\n결과 데이터프레임 (처음 5행):")
+print(head(results_df, 5))
+
+# ==================================================
+# 5. ggplot2 + gridExtra로 4분할 그래프 생성
+#    (Lower Bound 제외, Exclusivity 포함)
+# ==================================================
+
+# 5-1. Held-Out Likelihood 그래프
+p1 <- ggplot(results_df, aes(x = K, y = heldout)) +
+  geom_line(color = "#2E86AB", size = 1) + 
+  geom_point(color = "#2E86AB", size = 3) +
+  labs(title = "Held-Out Likelihood",
+       x = "Number of Topics (K)",
+       y = "Likelihood") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(size = 10)
+  ) +
+  scale_x_continuous(breaks = unique(results_df$K))
+
+# 5-2. Residuals 그래프
+p2 <- ggplot(results_df, aes(x = K, y = residual)) +
+  geom_line(color = "#A23B72", size = 1) + 
+  geom_point(color = "#A23B72", size = 3) +
+  labs(title = "Residuals",
+       x = "Number of Topics (K)",
+       y = "Residuals") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(size = 10)
+  ) +
+  scale_x_continuous(breaks = unique(results_df$K))
+
+# 5-3. Semantic Coherence 그래프
+p3 <- ggplot(results_df, aes(x = K, y = semcoh)) +
+  geom_line(color = "#F18F01", size = 1) + 
+  geom_point(color = "#F18F01", size = 3) +
+  labs(title = "Semantic Coherence",
+       x = "Number of Topics (K)",
+       y = "Coherence") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(size = 10)
+  ) +
+  scale_x_continuous(breaks = unique(results_df$K))
+
+# 5-4. Exclusivity 그래프
+p4 <- ggplot(results_df, aes(x = K, y = exclus)) +
+  geom_line(color = "#C73E1D", size = 1) + 
+  geom_point(color = "#C73E1D", size = 3) +
+  labs(title = "Exclusivity",
+       x = "Number of Topics (K)",
+       y = "Exclusivity") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(size = 10)
+  ) +
+  scale_x_continuous(breaks = unique(results_df$K))
+
+# 5-5. 4분할 그래프를 하나의 이미지로 저장
+combined_plot_path <- file.path(output_dir, "searchK_diagnostic_4metrics.png")
+
+g <- arrangeGrob(p1, p2, p3, p4, 
+                 ncol = 2, nrow = 2,
+                 top = "Diagnostic Values by Number of Topics")
+
+ggsave(filename = combined_plot_path, 
+       plot = g, 
+       width = GRAPH_WIDTH, 
+       height = GRAPH_HEIGHT,
+       dpi = GRAPH_DPI)
+
+message(sprintf("4분할 진단 그래프가 저장되었습니다: %s", combined_plot_path))
+
+# ===============================================
+# 6. 개별 그래프 저장 (선택사항: 각 지표별 고해상도 그래프)
+# ===============================================
+metrics <- c("semcoh", "exclus", "heldout", "residual")
+metric_labels <- c(
+  "semcoh" = "Semantic Coherence",
+  "exclus" = "Exclusivity",
+  "heldout" = "Held-Out Likelihood",
+  "residual" = "Residuals"
+)
+
+for (metric in metrics) {
+  p <- ggplot(results_df, aes(x = K, y = .data[[metric]])) +
+    geom_line(color = "#2E86AB", size = 1) + 
+    geom_point(color = "#2E86AB", size = 3) +
+    ggtitle(paste("SearchK Diagnostic:", metric_labels[metric])) +
+    labs(x = "Number of Topics (K)", y = metric_labels[metric]) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 13, face = "bold"),
+      panel.grid.minor = element_blank(),
+      axis.text = element_text(size = 11)
+    ) +
+    scale_x_continuous(breaks = unique(results_df$K))
+  
+  individual_plot_path <- file.path(output_dir, paste0("searchK_", metric, ".png"))
+  ggsave(filename = individual_plot_path,
+         plot = p, 
+         width = 9, 
+         height = 6,
+         dpi = GRAPH_DPI)
+  
+  message(sprintf("  ✓ %s 그래프 저장됨: %s", metric_labels[metric], individual_plot_path))
+}
+
+# =============================================
+# 7. 분석 결과 요약 테이블 저장
+# =============================================
+
+# 최적값 찾기 (방향성 고려)
+results_summary <- results_df %>%
+  mutate(
+    # Held-out likelihood: 높을수록 좋음 → 정규화 (높은 값을 높은 스코어로)
+    score_heldout = scale(heldout, center = TRUE, scale = TRUE)[, 1],
+    
+    # Residuals: 낮을수록 좋음 → 반전 정규화
+    score_residual = -scale(residual, center = TRUE, scale = TRUE)[, 1],
+    
+    # Semantic Coherence: 높을수록 좋음 (음수, 0에 가까울수록 좋음) → 정규화
+    score_semcoh = scale(semcoh, center = TRUE, scale = TRUE)[, 1],
+    
+    # Exclusivity: 높을수록 좋음 → 정규화
+    score_exclus = scale(exclus, center = TRUE, scale = TRUE)[, 1]
+  ) %>%
+  # 4가지 지표의 가중 평균 (동등 가중치)
+  mutate(
+    composite_score = (score_heldout + score_residual + score_semcoh + score_exclus) / 4
+  ) %>%
+  select(K, semcoh, exclus, heldout, residual, composite_score) %>%
+  arrange(desc(composite_score))
+
+message("\n=== 종합 분석 결과 (Composite Score 기준, 상위 5개) ===")
+print(head(results_summary, 5))
+
+# 결과 테이블 CSV 저장
+results_summary_path <- file.path(output_dir, "searchK_summary_table.csv")
+write_csv(results_summary, results_summary_path)
+message(sprintf("\n결과 테이블이 저장되었습니다: %s", results_summary_path))
+
+
+
+```
+
+## 토픽별 키워드와 비중
+
+```{r}
+
+# 0. 토픽 수 설정
+topic_numbers <- c(11)
+
+# 0-1. 상위 문서 수 설정
+top_docs_count <- 50
+
+# 1. 패키지 로드
+library(openxlsx)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(stm)
+
+# 2. 기본 경로 설정
+base_dir <- getwd()
+
+# 3. 전처리된 STM 데이터 불러오기
+out <- readRDS(file.path(base_dir, "topic_selection_results", "STM", "out_preprocessed.rds"))
+
+# 3-1. authoress_original.xlsx 파일 불러오기 (Contents 추출용)
+authoress_original <- read.xlsx(file.path(base_dir, "authoress_original.xlsx"))
+authoress_original$Date <- as.Date(paste(authoress_original$Year, authoress_original$Month, authoress_original$Day, sep = "-"))
+
+# 4. 메타데이터 변수 타입 및 formula 자동설정
+meta_names <- names(out$meta)
+
+if ("Publisher" %in% meta_names) {
+  if (!is.factor(out$meta$Publisher)) {
+    out$meta$Publisher <- as.factor(out$meta$Publisher)
+  }
+}
+
+hasVoca <- "Voca" %in% meta_names && all(!is.na(out$meta$Voca))
+if (hasVoca) {
+  out$meta$Voca <- as.factor(out$meta$Voca)
+}
+
+# 날짜 형식 유지
+if ("Date" %in% meta_names) {
+  out$meta$Date <- as.Date(out$meta$Date)
+}
+
+# prevalence formula 설정 (존재하는 변수만 반영)
+if (hasVoca && "Publisher" %in% meta_names) {
+  prevalence_formula <- ~Publisher + Voca + s(Date)
+} else if ("Publisher" %in% meta_names) {
+  prevalence_formula <- ~Publisher + s(Date)
+} else if (hasVoca) {
+  prevalence_formula <- ~Voca + s(Date)
+} else {
+  prevalence_formula <- ~s(Date)
+}
+
+# 5~12. 설정한 토픽 수별로 반복 실행
+for (optimal_K in topic_numbers) {
+  cat("============================================\n")
+  cat("   STM 분석 시작: 토픽 수 =", optimal_K, "\n")
+  cat("============================================\n")
+  
+  save_dir <- file.path(base_dir, paste0("STM_", optimal_K))
+  if (!dir.exists(save_dir)) dir.create(save_dir, recursive = TRUE)
+  
+  stm_model_path <- file.path(save_dir, "stm_model.rds")
+  if (file.exists(stm_model_path)) {
+    stm_model <- readRDS(stm_model_path)
+    cat("기존 모델 불러옴:", stm_model_path, "\n")
+  } else {
+    stm_model <- stm(
+      documents = out$documents,
+      vocab = out$vocab,
+      K = optimal_K,
+      prevalence = prevalence_formula,
+      data = out$meta,
+      init.type = "Spectral",
+      seed = 2024,
+      max.em.its = 75,
+      verbose = FALSE
+    )
+    saveRDS(stm_model, stm_model_path)
+    cat("새 모델 학습 및 저장:", stm_model_path, "\n")
+  }
+
+  topic_labels <- labelTopics(stm_model, n = 10)
+  keyword_types <- c("prob", "frex", "lift", "score")
+
+  prob_keywords <- as.data.frame(topic_labels$prob)
+  rownames(prob_keywords) <- paste0("Topic_", 1:nrow(prob_keywords))
+  colnames(prob_keywords) <- paste0("Rank_", 1:ncol(prob_keywords))
+
+  frex_keywords <- as.data.frame(topic_labels$frex)
+  rownames(frex_keywords) <- paste0("Topic_", 1:nrow(frex_keywords))
+  colnames(frex_keywords) <- paste0("Rank_", 1:ncol(frex_keywords))
+
+  beta_matrix <- exp(stm_model$beta$logbeta[[1]])
+  vocab <- stm_model$vocab
+  n_rank <- ncol(topic_labels$prob)
+
+  keyword_contrib_long <- list()
+  for (k in 1:optimal_K) {
+    for (type in keyword_types) {
+      terms <- topic_labels[[type]][k, ]
+      idx <- match(terms, vocab)
+      probs <- beta_matrix[k, idx]
+      rank_cols <- setNames(
+        as.list(sprintf("%s (%.4f)", terms, probs)),
+        paste0("Rank_", 1:n_rank)
+      )
+      keyword_contrib_long[[length(keyword_contrib_long) + 1]] <- 
+        data.frame(
+          Topic = paste0("Topic_", k),
+          Type = type,
+          rank_cols,
+          stringsAsFactors = FALSE
+        )
+    }
+  }
+  keyword_contrib_df <- do.call(rbind, keyword_contrib_long)
+  keyword_contrib_df <- keyword_contrib_df %>% arrange(Topic, factor(Type, levels = keyword_types))
+
+  topic_matrix <- stm_model[["theta"]]
+  average_topic_proportions <- colMeans(topic_matrix)
+  topic_proportion <- data.frame(
+    Topic = paste0("Topic_", 1:optimal_K),
+    Proportion = average_topic_proportions
+  )
+  topic_proportion$Percent <- sprintf("%.2f%%", topic_proportion$Proportion * 100)
+
+  topic_proportion_sorted <- topic_proportion %>%
+    arrange(desc(Proportion))
+
+  # 날짜 형식을 유지해서 저장
+  top_docs_list <- lapply(1:optimal_K, function(k) {
+    top_idx <- order(topic_matrix[, k], decreasing = TRUE)[1:top_docs_count]
+    
+    # Contents 추출 함수
+    get_contents <- function(date, publisher, title) {
+      matching_rows <- authoress_original %>%
+        filter(Date == date & Publisher == publisher & Title == title)
+      
+      if (nrow(matching_rows) > 0) {
+        return(matching_rows$Contents[1])
+      } else {
+        return(NA)
+      }
+    }
+    
+    df <- data.frame(
+      Topic = paste0("Topic_", k),
+      Rank = 1:top_docs_count,
+      Proportion = topic_matrix[top_idx, k],
+      Date = if ("Date" %in% meta_names) out$meta$Date[top_idx] else NA,
+      Publisher = if ("Publisher" %in% meta_names) out$meta$Publisher[top_idx] else NA,
+      Title = if ("Title" %in% meta_names) out$meta$Title[top_idx] else NA,
+      stringsAsFactors = FALSE
+    )
+    
+    # Contents 열 추가
+    if ("Date" %in% meta_names & "Publisher" %in% meta_names & "Title" %in% meta_names) {
+      df$Contents <- mapply(get_contents, df$Date, df$Publisher, df$Title)
+    } else {
+      df$Contents <- NA
+    }
+    
+    # Voca 열 추가
+    if (hasVoca) {
+      df$Voca <- out$meta$Voca[top_idx]
+    } else {
+      df$Voca <- NA
+    }
+    
+    return(df)
+  })
+  top_docs_df <- bind_rows(top_docs_list)
+  
+  # Date 열을 문자열로 변환 (yyyy-mm-dd 형식)
+  if ("Date" %in% colnames(top_docs_df)) {
+    top_docs_df$Date <- as.character(top_docs_df$Date)
+  }
+
+  # Prob 키워드를 비중 순서로 정렬한 버전
+  prob_keywords_sorted <- prob_keywords[order(match(rownames(prob_keywords), topic_proportion_sorted$Topic)), ]
+  
+  # FREX 키워드를 비중 순서로 정렬한 버전
+  frex_keywords_sorted <- frex_keywords[order(match(rownames(frex_keywords), topic_proportion_sorted$Topic)), ]
+
+  output_file <- file.path(save_dir, paste0("STM_", optimal_K, ".xlsx"))
+  wb <- createWorkbook()
+
+  addWorksheet(wb, "토픽별_비중")
+  addWorksheet(wb, "토픽별_Prob")
+  addWorksheet(wb, "토픽별_FREX")
+  addWorksheet(wb, "키워드 기여도")
+  addWorksheet(wb, paste0("토픽별 상위 ", top_docs_count, "문서"))
+
+  # 토픽별_비중 시트
+  writeData(wb, "토픽별_비중", "1. 토픽 번호순", startRow = 1, startCol = 1)
+  writeData(wb, "토픽별_비중", topic_proportion, startRow = 2, rowNames = FALSE)
+  start_row_sorted <- nrow(topic_proportion) + 4
+  writeData(wb, "토픽별_비중", "2. 비중 내림차순", startRow = start_row_sorted - 1, startCol = 1)
+  writeData(wb, "토픽별_비중", topic_proportion_sorted, startRow = start_row_sorted, rowNames = FALSE)
+
+  # 토픽별_Prob 시트 (번호순 + 비중순)
+  writeData(wb, "토픽별_Prob", "1. 토픽 번호순", startRow = 1, startCol = 1)
+  
+  # 비중 정보와 함께 출력
+  prob_with_proportion <- cbind(
+    Proportion = topic_proportion$Proportion[match(rownames(prob_keywords), topic_proportion$Topic)],
+    Percent = topic_proportion$Percent[match(rownames(prob_keywords), topic_proportion$Topic)],
+    prob_keywords
+  )
+  writeData(wb, "토픽별_Prob", prob_with_proportion, startRow = 2, rowNames = TRUE)
+  
+  start_row_prob <- nrow(prob_keywords) + 4
+  writeData(wb, "토픽별_Prob", "2. 비중 내림차순", startRow = start_row_prob, startCol = 1)
+  
+  prob_sorted_with_proportion <- cbind(
+    Proportion = topic_proportion_sorted$Proportion,
+    Percent = topic_proportion_sorted$Percent,
+    prob_keywords_sorted
+  )
+  writeData(wb, "토픽별_Prob", prob_sorted_with_proportion, startRow = start_row_prob + 1, rowNames = TRUE)
+
+  # 토픽별_FREX 시트 (번호순 + 비중순)
+  writeData(wb, "토픽별_FREX", "1. 토픽 번호순", startRow = 1, startCol = 1)
+  
+  # 비중 정보와 함께 출력
+  frex_with_proportion <- cbind(
+    Proportion = topic_proportion$Proportion[match(rownames(frex_keywords), topic_proportion$Topic)],
+    Percent = topic_proportion$Percent[match(rownames(frex_keywords), topic_proportion$Topic)],
+    frex_keywords
+  )
+  writeData(wb, "토픽별_FREX", frex_with_proportion, startRow = 2, rowNames = TRUE)
+  
+  start_row_frex <- nrow(frex_keywords) + 4
+  writeData(wb, "토픽별_FREX", "2. 비중 내림차순", startRow = start_row_frex, startCol = 1)
+  
+  frex_sorted_with_proportion <- cbind(
+    Proportion = topic_proportion_sorted$Proportion,
+    Percent = topic_proportion_sorted$Percent,
+    frex_keywords_sorted
+  )
+  writeData(wb, "토픽별_FREX", frex_sorted_with_proportion, startRow = start_row_frex + 1, rowNames = TRUE)
+
+  # 키워드 기여도 시트
+  writeData(wb, "키워드 기여도", keyword_contrib_df)
+  
+  # 토픽별 상위 문서 시트
+  docs_sheet_name <- paste0("토픽별 상위 ", top_docs_count, "문서")
+  writeData(wb, docs_sheet_name, top_docs_df)
+  
+  # 토픽별 상위 문서 시트에 맑은 고딕 폰트 적용
+  addStyle(wb, docs_sheet_name, 
+           createStyle(fontName = "맑은 고딕"), 
+           rows = 1:(nrow(top_docs_df) + 1), 
+           cols = 1:ncol(top_docs_df), 
+           gridExpand = TRUE)
+
+  saveWorkbook(wb, output_file, overwrite = TRUE)
+  cat("Saved STM results for K =", optimal_K, "to:", output_file, "\n")
+
+  # effect model formula에 존재하는 변수만 반영해 동적으로 구성
+  pred_var_list <- c()
+  if ("Publisher" %in% meta_names) pred_var_list <- c(pred_var_list, "Publisher")
+  if (hasVoca) pred_var_list <- c(pred_var_list, "Voca")
+  pred_var_list <- c(pred_var_list, "s(Date)")
+  effect_formula_str <- paste0("1:", optimal_K, " ~ ", paste(pred_var_list, collapse = " + "))
+  effect_formula <- as.formula(effect_formula_str)
+
+  stm_effect_model <- estimateEffect(
+    effect_formula,
+    stm_model,
+    meta = out$meta,
+    uncertainty = "Global",
+    prior = 1e-5
+  )
+  saveRDS(stm_effect_model, file.path(save_dir, "stm_effect_model.rds"))
+
+  cat("============================================\n\n")
+}
+
+```
+
+## 토픽 비중 추이
+
+```{r}
+
+library(stm)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+library(readr)
+library(scales)
+library(openxlsx)
+
+# ====== 사용자 설정 영역 (여기서만 수정) ======
+K_list <- c(11)    # 실행할 토픽 수 목록 예(10,11,12)
+year_min <- 1990             # 분석 시작 연도
+year_max <- 2025             # 분석 종료 연도
+year_breaks <- 5             # X축 연도 라벨 간격
+
+# ====== 그래프 폰트 크기 설정 ======
+font_size_title_all <- 22     # 전체 그래프 제목 폰트
+font_size_base_all <- 20      # 전체 그래프 기본 폰트 (축, 범례 등)
+font_size_axis_all <- 16      # 전체 그래프 축 눈금 폰트
+
+font_size_title_topic <- 22   # 개별 토픽 그래프 제목 폰트
+font_size_base_topic <- 18    # 개별 토픽 그래프 기본 폰트
+font_size_axis_topic <- 14    # 개별 토픽 그래프 축 눈금 폰트
+
+# ====== 반복 처리 시작 (모든 K에 대해 실행) ======
+for (optimal_K in K_list) {
+  
+  # ====== 폴더 설정 ======
+  base_dir <- file.path(getwd(), paste0("STM_", optimal_K))
+  date_dir <- file.path(base_dir, "Trend")
+  if (!dir.exists(date_dir)) dir.create(date_dir, recursive = TRUE)
+  
+  # ====== 모델 및 데이터 불러오기 ======
+  stm_model <- readRDS(file.path(base_dir, "stm_model.rds"))
+  out <- readRDS(file.path(getwd(), "topic_selection_results", "STM", "out_preprocessed.rds"))
+  meta <- out$meta
+  
+  # ====== 문서별 토픽 분포와 연도 결합 ======
+  theta_df <- as.data.frame(stm_model$theta)[, 1:optimal_K]
+  colnames(theta_df) <- paste0("Topic_", 1:optimal_K)
+  theta_df$Year <- year(meta$Date)
+  
+  # ====== 전체 누적 면적 그래프용 연도별 평균 비중 ======
+  topic_year_long <- theta_df %>%
+    group_by(Year) %>%
+    summarise(across(starts_with("Topic_"), mean, na.rm = TRUE)) %>%
+    filter(Year >= year_min, Year <= year_max) %>%
+    pivot_longer(cols = starts_with("Topic_"),
+                 names_to = "Topic",
+                 values_to = "Proportion") %>%
+    arrange(Topic, Year)
+  
+  topic_year_long$Topic_label <- factor(topic_year_long$Topic,
+                                        levels = paste0("Topic_", 1:optimal_K))
+  
+  # ====== 전체 누적 면적 그래프 (연도별) ======
+  p_area <- ggplot(topic_year_long, aes(x = Year, y = Proportion, fill = Topic_label)) +
+    geom_area(position = "fill", color = "white", size = 0.2, alpha = 0.95) +
+    scale_y_continuous(labels = percent_format(accuracy = 1), expand = c(0, 0)) +
+    scale_x_continuous(breaks = seq(year_min, year_max, by = year_breaks), 
+                       limits = c(year_min, year_max), expand = c(0, 0)) +
+    labs(title = "연도별 토픽 비중 (100% 누적 면적 그래프)",
+         x = "연도", y = "비중(%)") +
+    theme_minimal(base_size = font_size_base_all) +
+    theme(plot.title = element_text(face = "bold", size = font_size_title_all),
+          axis.title = element_text(size = font_size_base_all),
+          axis.text.x = element_text(angle = 45, hjust = 1, size = font_size_axis_all),
+          axis.text.y = element_text(size = font_size_axis_all),
+          legend.text = element_text(size = font_size_base_all - 2),
+          legend.title = element_text(size = font_size_base_all),
+          plot.background = element_rect(fill = "white", color = NA),
+          panel.background = element_rect(fill = "white", color = NA),
+          legend.background = element_rect(fill = "white", color = NA),
+          legend.box.background = element_rect(fill = "white", color = NA))
+  
+  ggsave(filename = file.path(date_dir, 
+                              paste0("연도별_토픽비중_전체_", year_min, "_", year_max, ".png")),
+         plot = p_area, width = 12, height = 7, dpi = 300, bg = "white")
+  
+  # ====== 개별 토픽별 꺾은선 그래프 (연도별, y축 0% 고정) ======
+  for (k in 1:optimal_K) {
+    topic_name <- paste0("Topic_", k)
+    topic_data <- topic_year_long %>% filter(Topic_label == topic_name)
+    
+    p_topic <- ggplot(topic_data, aes(x = Year, y = Proportion, group = 1)) +
+      geom_line(color = "#2C3E50", linewidth = 1) +
+      geom_point(color = "#2980B9", size = 2) +
+      scale_x_continuous(breaks = seq(year_min, year_max, by = year_breaks), 
+                         limits = c(year_min, year_max)) +
+      scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, NA)) +
+      labs(title = topic_name,
+           x = "연도", y = "평균 비중(%)") +
+      theme_minimal(base_size = font_size_base_topic) +
+      theme(plot.title = element_text(face = "bold", size = font_size_title_topic),
+            axis.title = element_text(size = font_size_base_topic),
+            axis.text.x = element_text(angle = 45, hjust = 1, size = font_size_axis_topic),
+            axis.text.y = element_text(size = font_size_axis_topic))
+    
+    ggsave(filename = file.path(date_dir, paste0("연도별_토픽비중_", topic_name, ".png")),
+           plot = p_topic, width = 8, height = 5, dpi = 300, bg = "white")
+  }
+  
+  # ====== 연도별 토픽 비중 데이터 엑셀 저장 ======
+  wb <- createWorkbook()
+  addWorksheet(wb, "연도별_토픽비중_데이터")
+  writeData(wb, "연도별_토픽비중_데이터", topic_year_long)
+  excel_filename <- paste0("STM_", optimal_K, "_yearly.xlsx")
+  saveWorkbook(wb, file.path(date_dir, excel_filename), overwrite = TRUE)
+  
+  cat("\n✓ K=", optimal_K, " 분석 완료!\n", sep = "")
+}
+
+cat("\n====== 모든 분석 완료 ======\n")
+
+```
+
+## 어휘별 효과추정
+
+```{r}
+library(stm)
+library(dplyr)
+library(ggplot2)
+library(openxlsx)
+library(scales)
+library(tidyr)
+
+optimal_K <- 8
+
+# 1. 경로 설정
+base_dir <- file.path(getwd(), paste0("STM_", optimal_K))
+voca_dir <- file.path(base_dir, "Voca")
+barplot_dir <- file.path(voca_dir, "barplot")
+diffplot_dir <- file.path(voca_dir, "differenceplot")
+if (!dir.exists(barplot_dir)) dir.create(barplot_dir, recursive = TRUE)
+if (!dir.exists(diffplot_dir)) dir.create(diffplot_dir, recursive = TRUE)
+
+# 2. 모델, 데이터 불러오기
+stm_model <- readRDS(file.path(base_dir, "stm_model.rds"))
+out <- readRDS(file.path(getwd(), "topic_selection_results", "STM", "out_preprocessed.rds"))
+meta <- out$meta
+
+# 3. Voca_group 생성
+meta$Voca_group <- as.factor(meta$Voca)
+
+# 4. barplot: 각 토픽별로 x축에 Voca_group이 나란히
+theta_df <- as.data.frame(stm_model$theta)
+colnames(theta_df) <- paste0("Topic_", 1:optimal_K)
+theta_df$Voca_group <- meta$Voca_group
+
+topic_voca_long <- theta_df %>%
+  group_by(Voca_group) %>%
+  summarise(across(starts_with("Topic_"), mean, na.rm = TRUE)) %>%
+  pivot_longer(cols = starts_with("Topic_"),
+               names_to = "Topic",
+               values_to = "Proportion") %>%
+  filter(!is.na(Voca_group)) %>%
+  arrange(Topic, Voca_group)
+
+# barplot 저장 (토픽별 K개 그래프)
+for (k in 1:optimal_K) {
+  topic_name <- paste0("Topic_", k)
+  voca_data <- topic_voca_long %>% filter(Topic == topic_name)
+  p_voca <- ggplot(voca_data, aes(x = Voca_group, y = Proportion, fill = Voca_group)) +
+    geom_col(show.legend = FALSE) +
+    scale_y_continuous(labels = percent_format(accuracy = 1)) +
+    labs(title = paste0("토픽별 Voca 그룹 비중 (", topic_name, ")"),
+         x = "Voca 그룹", y = "비중(%)") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+  ggsave(filename = file.path(barplot_dir, paste0("토픽별_Voca비중_barplot_", topic_name, ".png")),
+         plot = p_voca, width = 8, height = 5, dpi = 300, bg = "white")
+}
+
+# barplot 데이터 엑셀 저장
+wb_bar <- createWorkbook()
+addWorksheet(wb_bar, "Voca별_토픽비중_데이터")
+writeData(wb_bar, "Voca별_토픽비중_데이터", topic_voca_long)
+excel_filename_bar <- paste0("STM_", optimal_K, "_voca_barplot.xlsx")
+saveWorkbook(wb_bar, file.path(barplot_dir, excel_filename_bar), overwrite = TRUE)
+
+# 5. difference plot (엑셀 파일이 있으면 불러오고, 없으면 계산/저장)
+excel_path <- file.path(diffplot_dir, "differenceplot_all_vocagroups.xlsx")
+unique_groups <- na.omit(unique(meta$Voca_group))
+
+if (file.exists(excel_path)) {
+  sheet_names <- getSheetNames(excel_path)
+  result_list <- lapply(sheet_names, function(sheet) {
+    read.xlsx(excel_path, sheet = sheet)
+  })
+  names(result_list) <- sheet_names
+} else {
+  wb <- createWorkbook()
+  result_list <- list()
+  for (group in unique_groups) {
+    meta$Voca_group2 <- ifelse(meta$Voca_group == group, as.character(group), "전체")
+    meta$Voca_group2 <- factor(meta$Voca_group2, levels = c(as.character(group), "전체"))
+    stm_effect_model <- estimateEffect(1:optimal_K ~ Voca_group2, stm_model, meta = meta, uncertainty = "Global")
+    eff_summary <- summary(stm_effect_model, topics = 1:optimal_K)
+    result_df <- lapply(eff_summary$tables, function(tab) {
+      data.frame(
+        Estimate = tab[2, "Estimate"],
+        StdError = tab[2, "Std. Error"],
+        p_value = tab[2, "Pr(>|t|)"]
+      )
+    }) %>% bind_rows()
+    result_df$Topic <- paste0("Topic ", 1:optimal_K)
+    result_df$stars <- cut(result_df$p_value,
+      breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+      labels = c("***", "**", "*", "")
+    )
+    result_df$Topic <- factor(result_df$Topic, levels = paste0("Topic ", 1:optimal_K))
+    result_df <- result_df[, c("Topic", "stars", "p_value", "Estimate", "StdError")]
+    addWorksheet(wb, as.character(group))
+    writeData(wb, as.character(group), result_df)
+    result_list[[as.character(group)]] <- result_df
+  }
+  saveWorkbook(wb, excel_path, overwrite = TRUE)
+}
+
+```
+
+## 어휘별 그래프 그리기
+
+```{r}
+
+# ====== 패키지 로드 ======
+library(ggplot2)
+library(dplyr)
+library(openxlsx)
+
+# ====== 토픽 개수 및 경로 설정 ======
+optimal_K <- 8
+base_dir <- file.path(getwd(), paste0("STM_", optimal_K))
+voca_dir <- file.path(base_dir, "Voca")
+diffplot_dir <- file.path(voca_dir, "differenceplot")
+
+# 폴더 생성
+if (!dir.exists(diffplot_dir)) dir.create(diffplot_dir, recursive = TRUE)
+
+# ====== difference plot 그리기 (어휘 조합별, 신문사 코드와 동일 디자인) ======
+for (group in names(result_list)) {
+  result_df <- result_list[[group]]
+  
+  # 토픽 번호 추출 및 오름차순 정렬
+  result_df <- result_df %>%
+    mutate(Topic_num = as.numeric(gsub("Topic ", "", Topic))) %>%
+    arrange(Topic_num) %>%
+    mutate(Topic = factor(Topic, levels = Topic))
+  
+  # 유의미성 판정 (별 표기용)
+  result_df <- result_df %>%
+    mutate(stars = cut(p_value,
+                       breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+                       labels = c("***", "**", "*", "")))
+  
+  # ====== 신문사 코드와 동일한 디자인 ======
+  p_clean <- ggplot(result_df, aes(x = Estimate, y = Topic, fill = Estimate > 0)) +
+    geom_col(width = 0.5) +
+    geom_errorbarh(aes(xmin = Estimate - 1.96 * StdError, 
+                       xmax = Estimate + 1.96 * StdError),
+                   color = "black",
+                   height = 0.3, linewidth = 0.8) +
+    geom_vline(xintercept = 0, linetype = "solid", color = "black", linewidth = 0.8) +
+    geom_text(aes(label = stars, x = Estimate + 0.005), 
+              color = "darkred", hjust = 0, size = 6, fontface = "bold") +
+    scale_fill_manual(values = c("TRUE" = "#E74C3C", "FALSE" = "#3498DB"),
+                      labels = c("TRUE" = paste0(group, " < 평균 (덜 다룸)"), 
+                                 "FALSE" = paste0(group, " > 평균 (더 강조)")),
+                      name = "상대 비중") +
+    labs(
+      title = paste0("주요 어휘별 토픽 편향 분석: ", group),
+      x = "효과크기 (Estimate)\n[음수: 평균보다 더 강조 | 양수: 평균보다 덜 다룸]",
+      y = "토픽"
+    ) +
+    theme_minimal(base_family = "NanumGothic") +
+    theme(
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5, margin = margin(b = 15)),
+      axis.text.x = element_text(size = 12),
+      axis.text.y = element_text(size = 11),
+      axis.title.x = element_text(size = 12, margin = margin(t = 15), color = "darkred", face = "bold"),
+      axis.title.y = element_text(size = 12),
+      legend.position = "bottom",
+      legend.title = element_text(size = 11, face = "bold"),
+      legend.text = element_text(size = 10),
+      panel.grid.major.x = element_line(color = "gray90", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(t = 10, r = 10, b = 10, l = 10)
+    )
+  
+  ggsave(filename = file.path(diffplot_dir, paste0("differenceplot_", group, "_final.png")),
+         plot = p_clean, width = 10, height = 6.5, dpi = 300, bg = "white")
+  
+  # ====== 데이터 요약 출력 ======
+  cat("\n")
+  cat(paste(rep("=", 50), collapse = ""), "\n")
+  cat(group, "\n")
+  cat(paste(rep("=", 50), collapse = ""), "\n")
+  
+  cat("\n✓ 평균보다 더 강조하는 토픽 (파랑색, 음수, p<0.05):\n")
+  cat(paste(rep("-", 50), collapse = ""), "\n")
+  more_emphasis <- result_df %>% 
+    filter(Estimate < 0, p_value < 0.05) %>% 
+    select(Topic, Estimate, StdError, p_value, stars) %>%
+    mutate(
+      Estimate = round(Estimate, 4),
+      StdError = round(StdError, 4),
+      p_value = round(p_value, 5)
+    ) %>%
+    arrange(Estimate)
+  
+  if (nrow(more_emphasis) > 0) {
+    print(more_emphasis, row.names = FALSE)
+  } else {
+    cat("  없음\n")
+  }
+  
+  cat("\n✗ 평균보다 덜 다루는 토픽 (빨강색, 양수, p<0.05):\n")
+  cat(paste(rep("-", 50), collapse = ""), "\n")
+  less_emphasis <- result_df %>% 
+    filter(Estimate > 0, p_value < 0.05) %>%
+    select(Topic, Estimate, StdError, p_value, stars) %>%
+    mutate(
+      Estimate = round(Estimate, 4),
+      StdError = round(StdError, 4),
+      p_value = round(p_value, 5)
+    ) %>%
+    arrange(desc(Estimate))
+  
+  if (nrow(less_emphasis) > 0) {
+    print(less_emphasis, row.names = FALSE)
+  } else {
+    cat("  없음\n")
+  }
+  
+  cat("\n중립적 토픽 (p ≥ 0.05, 통계적으로 유의미하지 않음):\n")
+  cat(paste(rep("-", 50), collapse = ""), "\n")
+  neutral <- result_df %>% 
+    filter(p_value >= 0.05) %>%
+    select(Topic, Estimate, StdError, p_value) %>%
+    mutate(
+      Estimate = round(Estimate, 4),
+      StdError = round(StdError, 4),
+      p_value = round(p_value, 5)
+    )
+  
+  if (nrow(neutral) > 0) {
+    print(neutral, row.names = FALSE)
+  } else {
+    cat("  없음\n")
+  }
+}
+
+cat("\n")
+cat(paste(rep("=", 50), collapse = ""), "\n")
+print("✓ 모든 어휘별 difference plot이 생성되었습니다!")
+cat("저장 위치:", diffplot_dir, "\n")
+cat("파일명: differenceplot_[어휘명]_final.png\n")
+cat(paste(rep("=", 50), collapse = ""), "\n")
+```
+
+## 언론사별 효과추정
+
+```{r}
+
+library(stm)
+library(dplyr)
+library(ggplot2)
+library(openxlsx)
+library(scales)
+library(tidyr)
+
+# ====== 토픽 개수 설정 ======
+optimal_K <- 11
+
+# ====== 폴더 설정 및 생성 ======
+base_dir <- file.path(getwd(), paste0("STM_", optimal_K))
+publisher_dir <- file.path(base_dir, "Publisher")
+barplot_dir <- file.path(publisher_dir, "barplot")
+diffplot_dir <- file.path(publisher_dir, "differenceplot")
+if (!dir.exists(barplot_dir)) dir.create(barplot_dir, recursive = TRUE)
+if (!dir.exists(diffplot_dir)) dir.create(diffplot_dir, recursive = TRUE)
+
+# ====== 모델 및 데이터 불러오기 ======
+stm_model <- readRDS(file.path(base_dir, "stm_model.rds"))
+out <- readRDS(file.path(getwd(), "topic_selection_results", "STM", "out_preprocessed.rds"))
+meta <- out$meta
+
+# ====== 문서별 토픽 분포와 신문사 결합 ======
+theta_df <- as.data.frame(stm_model$theta)
+colnames(theta_df) <- paste0("Topic_", 1:optimal_K)
+theta_df$Publisher <- meta$Publisher
+
+# ====== 신문사별 토픽별 평균 비중 계산 (barplot용) ======
+topic_publisher_long <- theta_df %>%
+  group_by(Publisher) %>%
+  summarise(across(starts_with("Topic_"), mean, na.rm = TRUE)) %>%
+  pivot_longer(cols = starts_with("Topic_"),
+               names_to = "Topic",
+               values_to = "Proportion") %>%
+  filter(!is.na(Publisher)) %>%
+  arrange(Topic, Publisher)
+
+# ====== 토픽별 신문사 평균 비중 barplot 저장 (각 토픽별) ======
+for (k in 1:optimal_K) {
+  topic_name <- paste0("Topic_", k)
+  pub_data <- topic_publisher_long %>% filter(Topic == topic_name)
+  p_pub <- ggplot(pub_data, aes(x = Publisher, y = Proportion, fill = Publisher)) +
+    geom_col(show.legend = FALSE) +
+    scale_y_continuous(labels = percent_format(accuracy = 1)) +
+    labs(title = paste0("토픽별 신문사 비중 (", topic_name, ")"),
+         x = "신문사", y = "비중(%)") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+  ggsave(filename = file.path(barplot_dir, paste0("토픽별_신문사비중_barplot_", topic_name, ".png")),
+         plot = p_pub, width = 8, height = 5, dpi = 300, bg = "white")
+}
+
+# ====== barplot 데이터 엑셀 저장 ======
+wb_bar <- createWorkbook()
+addWorksheet(wb_bar, "신문사별_토픽비중_데이터")
+writeData(wb_bar, "신문사별_토픽비중_데이터", topic_publisher_long)
+excel_filename_bar <- paste0("STM_", optimal_K, "_publisher_barplot.xlsx")
+saveWorkbook(wb_bar, file.path(barplot_dir, excel_filename_bar), overwrite = TRUE)
+
+# ====== difference plot (엑셀 파일이 있으면 불러오고, 없으면 계산/저장) ======
+excel_path <- file.path(diffplot_dir, "differenceplot_all_publishers.xlsx")
+unique_publishers <- unique(meta$Publisher)
+
+if (file.exists(excel_path)) {
+  sheet_names <- getSheetNames(excel_path)
+  result_list <- lapply(sheet_names, function(sheet) {
+    read.xlsx(excel_path, sheet = sheet)
+  })
+  names(result_list) <- sheet_names
+} else {
+  wb <- createWorkbook()
+  result_list <- list()
+  
+  for (pub in unique_publishers) {
+    meta$Publisher_group <- ifelse(meta$Publisher == pub, pub, "전체")
+    meta$Publisher_group <- factor(meta$Publisher_group, levels = c(pub, "전체"))
+    
+    stm_effect_model <- estimateEffect(1:optimal_K ~ Publisher_group, 
+                                        stm_model, 
+                                        meta = meta, 
+                                        uncertainty = "Global")
+    eff_summary <- summary(stm_effect_model, topics = 1:optimal_K)
+    
+    result_df <- lapply(eff_summary$tables, function(tab) {
+      data.frame(
+        Estimate = tab[2, "Estimate"],
+        StdError = tab[2, "Std. Error"],
+        p_value = tab[2, "Pr(>|t|)"]
+      )
+    }) %>% bind_rows()
+    
+    result_df$Topic <- paste0("Topic ", 1:optimal_K)
+    result_df$stars <- cut(result_df$p_value,
+                           breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+                           labels = c("***", "**", "*", ""))
+    result_df$Topic <- factor(result_df$Topic, levels = paste0("Topic ", 1:optimal_K))
+    result_df <- result_df[, c("Topic", "stars", "p_value", "Estimate", "StdError")]
+    
+    addWorksheet(wb, pub)
+    writeData(wb, pub, result_df)
+    result_list[[pub]] <- result_df
+  }
+  
+  saveWorkbook(wb, excel_path, overwrite = TRUE)
+}
+
+# ====== difference plot 시각화 (각 신문사별) ======
+for (pub in names(result_list)) {
+  result_df <- result_list[[pub]]
+  
+  p_diff <- ggplot(result_df, aes(x = reorder(Topic, Estimate), y = Estimate)) +
+    geom_col(aes(fill = ifelse(p_value < 0.05, "유의미", "비유의미"))) +
+    geom_errorbar(aes(ymin = Estimate - 1.96*StdError, ymax = Estimate + 1.96*StdError),
+                  width = 0.2, color = "black") +
+    scale_fill_manual(values = c("유의미" = "#E74C3C", "비유의미" = "#95A5A6"),
+                      name = "통계적 유의성") +
+    labs(title = paste0("신문사별 토픽 차이 - ", pub),
+         x = "토픽", y = "효과크기 (Estimate)") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA),
+      legend.position = "bottom"
+    )
+  
+  ggsave(filename = file.path(diffplot_dir, paste0("신문사비교_differenceplot_", pub, ".png")),
+         plot = p_diff, width = 10, height = 6, dpi = 300, bg = "white")
+}
+
+print("✓ 모든 분석이 완료되었습니다!")
+print(paste0("- Barplot 저장 경로: ", barplot_dir))
+print(paste0("- Difference plot 저장 경로: ", diffplot_dir))
+
+
+```
+
+## 언론사별 그래프 그리기
+
+```{r}
+# ====== 패키지 로드 ======
+library(ggplot2)
+library(dplyr)
+library(openxlsx)
+
+# ====== 토픽 개수 및 경로 설정 ======
+optimal_K <- 11
+base_dir <- file.path(getwd(), paste0("STM_", optimal_K))
+publisher_dir <- file.path(base_dir, "Publisher")
+diffplot_dir <- file.path(publisher_dir, "differenceplot")
+
+# ====== difference plot 데이터 불러오기 ======
+excel_path <- file.path(diffplot_dir, "differenceplot_all_publishers.xlsx")
+if (!file.exists(excel_path)) stop("differenceplot_all_publishers.xlsx 파일이 존재하지 않습니다.")
+
+sheet_names <- getSheetNames(excel_path)
+result_list <- lapply(sheet_names, function(sheet) {
+  read.xlsx(excel_path, sheet = sheet)
+})
+names(result_list) <- sheet_names
+
+# ====== difference plot 그리기 (최종 버전: 라벨링 수정) ======
+for (pub in names(result_list)) {
+  result_df <- result_list[[pub]]
+  
+  # 토픽 번호 추출 및 오름차순 정렬
+  result_df <- result_df %>%
+    mutate(Topic_num = as.numeric(gsub("Topic ", "", Topic))) %>%
+    arrange(Topic_num) %>%
+    mutate(Topic = factor(Topic, levels = Topic))
+  
+  # 유의미성 판정 (별 표기용)
+  result_df <- result_df %>%
+    mutate(stars = cut(p_value,
+                       breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+                       labels = c("***", "**", "*", "")))
+  
+  # ====== 최종 버전: 정확한 라벨링 ======
+  p_clean <- ggplot(result_df, aes(x = Estimate, y = Topic, fill = Estimate > 0)) +
+    geom_col(width = 0.5) +
+    geom_errorbarh(aes(xmin = Estimate - 1.96 * StdError, 
+                       xmax = Estimate + 1.96 * StdError),
+                   color = "black",
+                   height = 0.3, linewidth = 0.8) +
+    geom_vline(xintercept = 0, linetype = "solid", color = "black", linewidth = 0.8) +
+    geom_text(aes(label = stars, x = Estimate + 0.005), 
+              color = "darkred", hjust = 0, size = 6, fontface = "bold") +
+    scale_fill_manual(values = c("TRUE" = "#E74C3C", "FALSE" = "#3498DB"),
+                      labels = c("TRUE" = paste0(pub, " < 평균 (덜 다룸)"), 
+                                 "FALSE" = paste0(pub, " > 평균 (더 강조)")),
+                      name = "상대 비중") +
+    labs(
+      title = paste0("언론사별 토픽 편향 분석: ", pub),
+      x = "[음수: 평균보다 더 강조 | 양수: 평균보다 덜 다룸]",
+      y = "토픽"
+    ) +
+    theme_minimal(base_family = "NanumGothic") +
+    theme(
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5, margin = margin(b = 15)),
+      axis.text.x = element_text(size = 12),
+      axis.text.y = element_text(size = 11),
+      axis.title.x = element_text(size = 12, margin = margin(t = 15), color = "darkred", face = "bold"),
+      axis.title.y = element_text(size = 12),
+      legend.position = "bottom",
+      legend.title = element_text(size = 11, face = "bold"),
+      legend.text = element_text(size = 10),
+      panel.grid.major.x = element_line(color = "gray90", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(t = 10, r = 10, b = 10, l = 10)
+    )
+  
+  ggsave(filename = file.path(diffplot_dir, paste0("differenceplot_", pub, "_final.png")),
+         plot = p_clean, width = 10, height = 6.5, dpi = 300, bg = "white")
+  
+  # ====== 데이터 요약 출력 ======
+  cat("\n")
+  cat(paste(rep("=", 50), collapse = ""), "\n")
+  cat(pub, "\n")
+  cat(paste(rep("=", 50), collapse = ""), "\n")
+  
+  cat("\n✓ 평균보다 더 강조하는 토픽 (파랑색, 음수, p<0.05):\n")
+  cat(paste(rep("-", 50), collapse = ""), "\n")
+  more_emphasis <- result_df %>% 
+    filter(Estimate < 0, p_value < 0.05) %>% 
+    select(Topic, Estimate, StdError, p_value, stars) %>%
+    mutate(
+      Estimate = round(Estimate, 4),
+      StdError = round(StdError, 4),
+      p_value = round(p_value, 5)
+    ) %>%
+    arrange(Estimate)
+  
+  if (nrow(more_emphasis) > 0) {
+    print(more_emphasis, row.names = FALSE)
+  } else {
+    cat("  없음\n")
+  }
+  
+  cat("\n✗ 평균보다 덜 다루는 토픽 (빨강색, 양수, p<0.05):\n")
+  cat(paste(rep("-", 50), collapse = ""), "\n")
+  less_emphasis <- result_df %>% 
+    filter(Estimate > 0, p_value < 0.05) %>%
+    select(Topic, Estimate, StdError, p_value, stars) %>%
+    mutate(
+      Estimate = round(Estimate, 4),
+      StdError = round(StdError, 4),
+      p_value = round(p_value, 5)
+    ) %>%
+    arrange(desc(Estimate))
+  
+  if (nrow(less_emphasis) > 0) {
+    print(less_emphasis, row.names = FALSE)
+  } else {
+    cat("  없음\n")
+  }
+  
+  cat("\n중립적 토픽 (p ≥ 0.05, 통계적으로 유의미하지 않음):\n")
+  cat(paste(rep("-", 50), collapse = ""), "\n")
+  neutral <- result_df %>% 
+    filter(p_value >= 0.05) %>%
+    select(Topic, Estimate, StdError, p_value) %>%
+    mutate(
+      Estimate = round(Estimate, 4),
+      StdError = round(StdError, 4),
+      p_value = round(p_value, 5)
+    )
+  
+  if (nrow(neutral) > 0) {
+    print(neutral, row.names = FALSE)
+  } else {
+    cat("  없음\n")
+  }
+}
+
+cat("\n")
+cat(paste(rep("=", 50), collapse = ""), "\n")
+print("✓ 모든 difference plot이 생성되었습니다!")
+cat("저장 위치:", diffplot_dir, "\n")
+cat("파일명: differenceplot_[신문사명]_final.png\n")
+cat(paste(rep("=", 50), collapse = ""), "\n")
+
+
+```
+
+```{r}
+
+```
+
+```{r}
+```
